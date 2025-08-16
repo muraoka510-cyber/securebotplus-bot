@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: securebotplus
+    runtime: python
+    plan: starter   # ← free ではなく starter などに変更
+    region: singapore
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python secure_bot_plus.py"
+    envVars:
+      - key: TOKEN
+        sync: false
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
