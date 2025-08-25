@@ -1,4 +1,12 @@
-# SecureBotPlus v1.4 - 全コマンド「!」/ 高機能ログ / 連投対策 / WL / 重大アクション即BAN / Spotlight
+# SecureBotPlus v1.5 - 全コマンド「!」/ 高機能ログ / 連投対策 / WL / 重大アクション即BAN / Spotlight
+# New in v1.5:
+#   - 誤判定救済コマンド（解除系）
+#       * !verify            … Quarantine解除 + Verified付与
+#       * !unquarantine      … Quarantineのみ解除
+#       * !unmute            … Mute/Cooldownロール解除 + クールダウン状態解除
+#       * !cooldown_clear    … クールダウンのみ解除
+#       * !pardon            … 総合復旧（Quarantine解除 + ミュート解除 + Verified付与）
+#
 # New in v1.4:
 #   - WL限定コマンドシステム
 #       * 既定設定に "restricted_commands" を追加
@@ -84,6 +92,9 @@ DEFAULT_RESTRICTED_COMMANDS = [
     "spotlight_on","spotlight_off","spotlight_now",
     "spotlight_profile_save","spotlight_profile_load","spotlight_profile_use",
     "spotlight_profile_delete",
+
+    # 解除系（誤判定救済）
+    "verify","unquarantine","unmute","cooldown_clear","pardon",
 
     # 閲覧系まで締めたい場合は↓を有効化
     # "spotlight_status","spotlight_profile_show","security_status","security_overview",
@@ -1010,7 +1021,7 @@ async def ping(ctx: commands.Context): await ctx.reply("pong 🏓", mention_auth
 async def hello_prefix(ctx: commands.Context): await ctx.reply("👋 動いてます！（prefix版）", mention_author=False)
 
 @bot.command(name="version")
-async def version_cmd(ctx: commands.Context): await ctx.reply("SecureBotPlus v1.4（WL限定コマンド搭載）", mention_author=False)
+async def version_cmd(ctx: commands.Context): await ctx.reply("SecureBotPlus v1.5（WL限定＋解除系コマンド搭載）", mention_author=False)
 
 @bot.command(name="debug_perms")
 async def debug_perms_cmd(ctx: commands.Context):
@@ -1222,6 +1233,127 @@ async def cooldown_status_cmd(ctx):
             targets.append(f"{label}（残り ~{int((until-now).total_seconds()//60)}分）")
     text=f"ロール: `{cd.get('role_name','CooldownMuted')}`\n長さ: {int(cd.get('duration_sec',900))} 秒\n対象者: " + (", ".join(targets) if targets else "なし")
     await ctx.reply(text, mention_author=False)
+
+# ---- 誤判定救済コマンド（解除系） ----
+
+def _collect_quarantine_role_names(conf: dict) -> set[str]:
+    # 設定値と歴史的表記ゆれの両方に対応（"Quarantine" / "Quarantined"）
+    q1 = conf.get("captcha", {}).get("quarantine_role_name", "Quarantine")
+    return {q1, "Quarantined"}
+
+async def _remove_named_roles(member: discord.Member, names: set[str]) -> list[str]:
+    removed = []
+    roles = [r for r in member.roles if r.name in names]
+    if roles:
+        try:
+            await member.remove_roles(*roles, reason="SecureBotPlus: manual recovery")
+            removed = [r.name for r in roles]
+        except discord.Forbidden:
+            pass
+    return removed
+
+@bot.command(name="verify", help="誤判定ユーザーを救済：Quarantine系ロールを外し、Verifiedロールを付与")
+async def verify_cmd(ctx: commands.Context, member: discord.Member):
+    if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
+    conf = guild_conf(ctx.guild.id)
+
+    # Quarantine系を外す
+    q_removed = await _remove_named_roles(member, _collect_quarantine_role_names(conf))
+
+    # Verified を付与
+    vname = conf.get("captcha", {}).get("verified_role_name", "Verified")
+    vrole = await ensure_role(ctx.guild, vname, send_lock=False)
+    v_added = False
+    if vrole and vrole not in member.roles:
+        try:
+            await member.add_roles(vrole, reason="SecureBotPlus: manual verify")
+            v_added = True
+        except discord.Forbidden:
+            pass
+
+    q_txt = ("、".join(q_removed) if q_removed else "なし")
+    v_txt = (vrole.mention if (vrole and v_added) else "なし")
+    await ctx.reply(f"✅ {member.mention} を復旧しました｜Quarantine除去: {q_txt} / Verified付与: {v_txt}", mention_author=False)
+
+@bot.command(name="unquarantine", help="Quarantine系ロールを外す（Verifiedは付与しない）")
+async def unquarantine_cmd(ctx: commands.Context, member: discord.Member):
+    if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
+    conf = guild_conf(ctx.guild.id)
+    q_removed = await _remove_named_roles(member, _collect_quarantine_role_names(conf))
+    if q_removed:
+        await ctx.reply(f"🧹 {member.mention} から Quarantine を除去しました（{ '、'.join(q_removed) }）", mention_author=False)
+    else:
+        await ctx.reply(f"ℹ️ {member.mention} に Quarantine 系ロールは付いていません。", mention_author=False)
+
+@bot.command(name="unmute", help="ミュート系を解除：MuteロールとCooldownロールを外し、必要ならCooldown状態もクリア")
+async def unmute_cmd(ctx: commands.Context, member: discord.Member):
+    if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
+    conf = guild_conf(ctx.guild.id)
+
+    # 設定名を取得
+    mute_name = (conf.get("burst_punish", {}) or {}).get("mute_role_name", "Muted")
+    cd_role_name = (conf.get("cooldown", {}) or {}).get("role_name", "CooldownMuted")
+
+    # ロール除去
+    removed = await _remove_named_roles(member, {mute_name, cd_role_name})
+
+    # クールダウン辞書をクリア
+    key = (ctx.guild.id, member.id)
+    was_cd = bool(cooldown_until.pop(key, None))
+
+    if removed or was_cd:
+        flags = []
+        if removed: flags.append("ロール: " + "、".join(removed))
+        if was_cd: flags.append("クールダウン: 解除")
+        await ctx.reply(f"🔈 {member.mention} のミュート系を解除しました（{ ' / '.join(flags) }）", mention_author=False)
+    else:
+        await ctx.reply(f"ℹ️ {member.mention} はミュート/Cooldown対象ではありません。", mention_author=False)
+
+@bot.command(name="cooldown_clear", help="対象ユーザーのクールダウンのみ即時解除（ロールも外す）")
+async def cooldown_clear_cmd(ctx: commands.Context, member: discord.Member):
+    if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
+    conf = guild_conf(ctx.guild.id)
+    cd_role_name = (conf.get("cooldown", {}) or {}).get("role_name", "CooldownMuted")
+
+    # ロール除去 & 状態クリア
+    removed = await _remove_named_roles(member, {cd_role_name})
+    was_cd = bool(cooldown_until.pop((ctx.guild.id, member.id), None))
+
+    if removed or was_cd:
+        await ctx.reply(f"⏳➡️ {member.mention} のクールダウンを解除しました。", mention_author=False)
+    else:
+        await ctx.reply(f"ℹ️ {member.mention} はクールダウン中ではありません。", mention_author=False)
+
+@bot.command(name="pardon", help="総合復旧：Quarantine解除＋ミュート解除＋Verified付与")
+async def pardon_cmd(ctx: commands.Context, member: discord.Member):
+    if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
+    conf = guild_conf(ctx.guild.id)
+
+    # Quarantine解除
+    q_removed = await _remove_named_roles(member, _collect_quarantine_role_names(conf))
+
+    # ミュート解除（Mute/Cooldownロール、Cooldown状態）
+    mute_name = (conf.get("burst_punish", {}) or {}).get("mute_role_name", "Muted")
+    cd_role_name = (conf.get("cooldown", {}) or {}).get("role_name", "CooldownMuted")
+    m_removed = await _remove_named_roles(member, {mute_name, cd_role_name})
+    cooldown_until.pop((ctx.guild.id, member.id), None)
+
+    # Verified付与
+    vname = conf.get("captcha", {}).get("verified_role_name", "Verified")
+    vrole = await ensure_role(ctx.guild, vname, send_lock=False)
+    v_added = False
+    if vrole and vrole not in member.roles:
+        try:
+            await member.add_roles(vrole, reason="SecureBotPlus: pardon -> verified")
+            v_added = True
+        except discord.Forbidden:
+            pass
+
+    parts = []
+    if q_removed: parts.append("Quarantine除去: " + "、".join(q_removed))
+    if m_removed: parts.append("ミュート系除去: " + "、".join(m_removed))
+    parts.append("Verified付与: " + (vrole.mention if (vrole and v_added) else "なし"))
+    await ctx.reply(f"🕊️ {member.mention} を復旧しました｜" + " / ".join(parts), mention_author=False)
 
 # ---- Spotlight 設定コマンド（強化） ----
 
@@ -1564,7 +1696,7 @@ async def security_overview_cmd(ctx: commands.Context):
     emb.add_field(name=f"WL Roles ({len(r_names)})", value=("、".join(r_names) or "（なし）"), inline=False)
     await ctx.reply(embed=emb, mention_author=False)
 
-# ---- WL限定コマンド設定（追加/削除/一覧/クリア） ----
+# ---- WL限定コマンド設定（追加/削除/一覧/クリア）----
 @bot.command(name="cmdwl_add", help="WL限定にするコマンドを追加: !cmdwl_add lockdown burst_set ...")
 async def cmdwl_add_cmd(ctx: commands.Context, *names: str):
     if not _need_manage_guild(ctx): return await _deny_manage_guild(ctx)
